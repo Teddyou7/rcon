@@ -15,6 +15,7 @@
 # written by [ASY]Zyrain
 #
 */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -23,15 +24,16 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <string.h>
-#include <limits.h> // for INT_MAX
+#include <time.h>
+#include <unistd.h>
 
 #define DEBUG 0
- 
+
 #define SERVERDATA_EXECCOMMAND 2
 #define SERVERDATA_AUTH 3
 #define SERVERDATA_RESPONSE_VALUE 0
 #define SERVERDATA_AUTH_RESPONSE 2
- 
+
 int send_rcon(int sock, int id, int command, char *string1, char *string2) {
   int size, ret;
   size = 10+strlen(string1)+strlen(string2);
@@ -73,7 +75,8 @@ int recv_rcon(int sock, int timeout, int *id, int *command, char *string1,
   char *ptr;
   int ret;
   char buf[8192];
-  int total_size = 0;
+  int total_received = 0;
+  int received_large_packet = 0; // 新增变量，用于标记是否收到过大于1400字节的包
 
   size=0xDEADBEEF;
   *id=0xDEADBEEF;
@@ -81,66 +84,76 @@ int recv_rcon(int sock, int timeout, int *id, int *command, char *string1,
   string1[0]=0;
   string2[0]=0;
 
+  tv.tv_sec = timeout;
+  tv.tv_usec = 0;
+
   FD_ZERO(&readfds);
   FD_SET(sock, &readfds);
 
-  // Set timeout to 0 seconds initially
-  tv.tv_sec = 0;
-  tv.tv_usec = 0;
+  /* don't care about writefds and exceptfds: */
+  select(sock+1, &readfds, NULL, NULL, &tv);
 
-  while (1) {
-    /* don't care about writefds and exceptfds: */
-    select(sock+1, &readfds, NULL, NULL, &tv);
-
-    if (!FD_ISSET(sock, &readfds)) {
-      // If no data received, timeout
-      if(DEBUG) { 
-        printf("recv timeout\n");
-      }
-      return -1; // timeout
+  if (!FD_ISSET(sock, &readfds)) {
+    if(DEBUG) { 
+      printf("recv timeout\n");
     }
+    return -1; // timeout
+  }
+  if(DEBUG) printf("Got a response\n");
+  ret = recv(sock, &size, sizeof(int), 0);
+  if(ret == -1) {
+    perror("recv() failed:");
+    return -1;
+  }
+  if((size<10) || (size>8192)) {
+    printf("Illegal size %d\n",size);
+    exit(-1);
+  }
+  ret = recv(sock, id, sizeof(int),0);
+  if(ret == -1) {
+    perror("recv() failed:");
+    return -1;
+  }
+  size-=ret;
+  ret = recv(sock, command, sizeof(int),0);
+  if(ret == -1) {
+    perror("recv() failed:");
+    return -1;
+  }
+  size-=ret;
 
-    if(DEBUG) printf("Got a response\n");
-    ret = recv(sock, &size, sizeof(int), 0);
+  ptr = buf;
+  while(size) {
+    ret = recv(sock, ptr, size, 0);
     if(ret == -1) {
       perror("recv() failed:");
       return -1;
     }
-    if((size<10) || (size>8192)) {
-      printf("Illegal size %d\n",size);
+    size -= ret; 
+    ptr += ret;
+    total_received += ret;
+
+    // Check if we need to continue receiving data
+    if (total_received >= 1400) {
+      received_large_packet = 1; // 标记已收到大于1400字节的包
+      // Reset the timeout for the next select call
+      tv.tv_sec = 0;
+      tv.tv_usec = 20000; // 0.05 seconds
+
+      FD_ZERO(&readfds);
+      FD_SET(sock, &readfds);
+
+      select(sock+1, &readfds, NULL, NULL, &tv);
+
+      if (!FD_ISSET(sock, &readfds)) {
+        break; // No more data to receive
+      }
+    } else if (received_large_packet) {
+      // 如果已经收到过大于1400字节的包，再收到小于1400字节的包则终止收包并退出程序
+      // printf("Received packet size less than 1400 bytes after a large packet, terminating...\n");
       exit(-1);
     }
-    ret = recv(sock, id, sizeof(int),0);
-    if(ret == -1) {
-      perror("recv() failed:");
-      return -1;
-    }
-    size-=ret;
-    ret = recv(sock, command, sizeof(int),0);
-    if(ret == -1) {
-      perror("recv() failed:");
-      return -1;
-    }
-    size-=ret;
-
-    ptr = buf + total_size;
-    while(size) {
-      ret = recv(sock, ptr, size, 0);
-      if(ret == -1) {
-        perror("recv() failed:");
-        return -1;
-      }
-      size -= ret; 
-      ptr += ret;
-    }
-    total_size += (ptr - (buf + total_size));
-
-    // Check if the received data size is greater than 1400 bytes
-    if (ptr - buf <= 1400) {
-      break; // No more data expected
-    }
   }
-
   buf[8190] = 0;
   buf[8191] = 0;
 
@@ -150,7 +163,7 @@ int recv_rcon(int sock, int timeout, int *id, int *command, char *string1,
   
   return 0;
 }
- 
+
 /* This is set to 1 when we've been authorized */
 int auth = 0;
 char string1[4096];
@@ -180,20 +193,52 @@ int process_response(int sock) {
     default:
       printf("Bad Auth Response ID = %d\n",id);
       exit(-1);
-    }
+    };
     break;
   case SERVERDATA_RESPONSE_VALUE:
     printf("%s",string1);
     break;
   default:
-    printf("Unexpected command: %d",command);
+    if (!auth) {
+      printf("Unexpected command: %d\n", command);
+    }
     break;
-  }
+  };
 }
- 
+
+int connect_with_retry(const char *address, short port, int max_retries) {
+  struct sockaddr_in a;
+  int sock;
+  int ret;
+  struct timespec ts;
+
+  for (int attempt = 0; attempt < max_retries; attempt++) {
+    sock = socket(AF_INET, SOCK_STREAM, 0); // TCP socket
+    if (sock == -1) {
+      perror("socket() failed");
+      continue;
+    }
+
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = inet_addr(address);
+    a.sin_port = htons(port);
+
+    ret = connect(sock, (struct sockaddr *)&a, sizeof(a));
+    if (ret == 0) {
+      return sock; // Connection successful
+    }
+
+    close(sock);
+    clock_gettime(CLOCK_REALTIME, &ts);
+    printf("Connection failed at %ld.%03ld, retrying (%d/%d)...\n", ts.tv_sec, ts.tv_nsec / 1000000, attempt + 1, max_retries);
+    sleep(1); // Wait before retrying
+  }
+
+  return -1; // All retries failed
+}
+
 int main(int argc, char **argv)
 {
-  struct sockaddr_in a;
   int sock;
   int ret, i;
   char password[512]="YOUR_PASSWORD_HERE";
@@ -218,118 +263,89 @@ int main(int argc, char **argv)
       break; /* done with args */
     switch(argv[arg][1]) {
     case 'a':
-      strncpy(address, argv[arg]+2, sizeof(address)-1);
-      address[sizeof(address)-1] = '\0'; // Ensure null-termination
+      strncpy(address, argv[arg]+2, 512);
       break;
     case 'p':
-      ret = atoi(argv[arg]+2);
-      if (ret <= 0 || ret > INT_MAX) {
-        fprintf(stderr, "Invalid port number\n");
-        return 0;
-      }
-      port = (short)ret;
+      port = atoi(argv[arg]+2);
       break;
     case 'P':
-      strncpy(password, argv[arg]+2, sizeof(password)-1);
-      password[sizeof(password)-1] = '\0'; // Ensure null-termination
+      strncpy(password, argv[arg]+2, 512);
       break;
     default:
       fprintf(stderr, "Unknown option -%c\n",argv[arg][1]);
       return 0;
     }
   }
-
-  a.sin_family = AF_INET;
-  ret = inet_pton(AF_INET, address, &a.sin_addr);
-  if (ret <= 0) {
-    if (ret == 0)
-      fprintf(stderr, "Invalid address\n");
-    else
-      perror("inet_pton");
-    return -1;
-  }
-  a.sin_port = htons(port);
-
-  int max_retries = 5;
-  int retry_count = 0;
-  struct timespec wait_time;
-  wait_time.tv_sec = 0;
-  wait_time.tv_nsec = 100000000; // 0.1 seconds
-
-  while (retry_count < max_retries) {
-    sock = socket(AF_INET, SOCK_STREAM, 0); // TCP socket
-
-    ret = connect(sock, (struct sockaddr *)&a, sizeof(a));
-
-    if (ret == -1) {
-      perror("connect() failed.");
-      close(sock);
-      retry_count++;
-      nanosleep(&wait_time, NULL); // Wait for 0.1 seconds before retrying
-      printf("Retry %d of %d\n", retry_count, max_retries); // 输出重试次数
-    } else {
-      if (DEBUG) printf("Connected to Server\n");
-      break;
-    }
-  }
-
-  if (retry_count == max_retries) {
-    fprintf(stderr, "Failed to connect after %d retries\n", max_retries);
+  
+  sock = connect_with_retry(address, port, 5);
+  if (sock == -1) {
+    printf("Failed to connect after 5 retries\n");
     return -1;
   }
 
-  if (DEBUG) printf("Sending RCON Password\n");
-  ret = send_rcon(sock, 20, SERVERDATA_AUTH, password, "");
-
-  if (ret == -1) {
+  if(DEBUG) printf("Connected to Server\n");
+  
+  if(DEBUG) printf("Sending RCON Password\n");
+  ret=send_rcon(sock, 20, SERVERDATA_AUTH, password, "");
+ 
+  if(ret == -1) {
     perror("Sending password");
-    close(sock);
     return -1;
-  }
-
-  while (auth == 0) {
-    if (process_response(sock) == -1) {
+  };
+ 
+  while(auth==0) {
+    if(process_response(sock)==-1) {
       printf("Couldn't Authenticate\n");
       close(sock);
-      return -1;
+      sock = connect_with_retry(address, port, 5);
+      if (sock == -1) {
+        printf("Failed to reconnect after 5 retries\n");
+        return -1;
+      }
+      if(DEBUG) printf("Reconnected to Server\n");
+      if(DEBUG) printf("Sending RCON Password\n");
+      ret=send_rcon(sock, 20, SERVERDATA_AUTH, password, "");
+      if(ret == -1) {
+        perror("Sending password");
+        return -1;
+      };
     }
   }
-
-  if (DEBUG) printf("Password Accepted\n");
+ 
+  if(DEBUG) printf("Password Accepted\n");
   /* Now we're authorized, send command */
-
+ 
   /* built command */
   ret = 0;
-  while (arg < argc) {
-    if (strlen(argv[arg]) + ret < sizeof(string1) - 1) {
-      strcpy(string1 + ret, argv[arg]);
+  while(arg < argc) {
+    if(strlen(argv[arg]) + ret < 4096) {
+      strcpy(string1+ret, argv[arg]);
       ret += strlen(argv[arg]);
-      if (arg < argc - 1) { // Add space only if it's not the last argument
-        string1[ret] = ' ';
-        ret++;
-      }
+      string1[ret] = ' ';
+      ret++;
       arg++;
     } else {
       fprintf(stderr, "cmd too long to send\n");
-      close(sock);
       return -1;
     }
   }
-  string1[ret] = 0;
-
-  if (DEBUG) printf("Sending Command: \"%s\"\n", string1);
-
-  ret = send_rcon(sock, 20, SERVERDATA_EXECCOMMAND, string1, "");
-
-  if (ret == -1) {
+  //  string1[ret] = '\n';
+  //ret++;
+  ret--;
+  string1[ret]=0;
+ 
+  if(DEBUG) printf("Sending Command: \"%s\"\n", string1);
+ 
+  ret=send_rcon(sock, 20, SERVERDATA_EXECCOMMAND, string1, "");
+ 
+  if(ret == -1) {
     perror("cmd send");
-    close(sock);
     return -1;
   }
-
+ 
   // process responses until a timeout
-  while (process_response(sock) != -1);
-
+  while(process_response(sock) != -1);
+  
   close(sock);
   return 0;
 }
